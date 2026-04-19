@@ -1,7 +1,7 @@
 
 import React, { useState, useCallback, useEffect } from 'react';
 import { AnalysisResult, UserProfile } from './types';
-import { analyzeDocument } from './services/geminiService';
+import { analyzeDocument, GeminiServiceError } from './services/geminiService';
 import FileUploader from './components/FileUploader';
 import DocumentViewer from './components/DocumentViewer';
 import Dashboard from './components/Dashboard';
@@ -75,7 +75,11 @@ const App: React.FC = () => {
         setView('dashboard');
       }
     } catch (error) {
-      alert("Error processing documents. Please ensure they are clear images or PDFs.");
+      if (error instanceof GeminiServiceError) {
+        alert(error.message);
+      } else {
+        alert("Error processing documents. Please ensure they are clear images or PDFs.");
+      }
       console.error(error);
     } finally {
       setIsProcessing(false);

@@ -4,6 +4,7 @@ import { AnalysisResult, ForgeryStatus } from "../types";
 import { GEMINI_API_KEY } from "./geminiConfig";
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+const GEMINI_MODEL_CANDIDATES = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"] as const;
 
 type AnalysisSignals = {
   visualTampering?: number;
@@ -23,6 +24,20 @@ type GeminiAnalysisResponse = {
   metadataInconsistencies?: string[];
   analysisSignals?: AnalysisSignals;
 };
+
+type GeminiServiceErrorCode = "QUOTA_EXCEEDED" | "MODEL_UNAVAILABLE" | "AUTH_ERROR" | "API_ERROR";
+
+export class GeminiServiceError extends Error {
+  code: GeminiServiceErrorCode;
+  retryAfterSeconds?: number;
+
+  constructor(message: string, code: GeminiServiceErrorCode, retryAfterSeconds?: number) {
+    super(message);
+    this.name = "GeminiServiceError";
+    this.code = code;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
 
 const SYSTEM_INSTRUCTION = `
 You are an expert Forensic Document Examiner (FDE) specialized in detecting digital and physical document forgery. 
@@ -116,6 +131,94 @@ const normalizeSignals = (analysisSignals?: AnalysisSignals): Required<AnalysisS
 });
 
 const resolveSignal = (primary: number, fallback: number) => (primary > 0 ? primary : fallback);
+
+const extractRetryDelaySeconds = (error: unknown) => {
+  const retryFromDetails = (error as { error?: { details?: Array<{ retryDelay?: string }> } })?.error?.details?.find(
+    (detail) => typeof detail?.retryDelay === "string",
+  )?.retryDelay;
+  if (retryFromDetails) {
+    const match = retryFromDetails.match(/(\d+)/);
+    if (match) {
+      return Number(match[1]);
+    }
+  }
+
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const retryMatch = errorMessage.match(/retry in\s+(\d+(?:\.\d+)?)s/i);
+  return retryMatch ? Math.ceil(Number(retryMatch[1])) : undefined;
+};
+
+const getErrorStatusCode = (error: unknown) => {
+  const directCode = (error as { status?: number; code?: number; error?: { code?: number } })?.status
+    ?? (error as { code?: number; error?: { code?: number } })?.code
+    ?? (error as { error?: { code?: number } })?.error?.code;
+
+  if (typeof directCode === "number") {
+    return directCode;
+  }
+
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const parsedCode = errorMessage.match(/"code":\s*(\d{3})/);
+  return parsedCode ? Number(parsedCode[1]) : undefined;
+};
+
+const isQuotaError = (error: unknown) => {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  return getErrorStatusCode(error) === 429 || /RESOURCE_EXHAUSTED|quota exceeded/i.test(errorMessage);
+};
+
+const isModelUnavailableError = (error: unknown) => {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  return getErrorStatusCode(error) === 404 || /not found for api version|not supported for generateContent/i.test(errorMessage);
+};
+
+const isAuthError = (error: unknown) => {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const statusCode = getErrorStatusCode(error);
+  return statusCode === 400 || statusCode === 401 || statusCode === 403 || /api key not valid|permission denied|forbidden|billing|api has not been used|access denied/i.test(errorMessage);
+};
+
+const extractApiMessage = (error: unknown) => {
+  const directMessage = (error as { error?: { message?: string } })?.error?.message;
+  if (typeof directMessage === "string" && directMessage.trim()) {
+    return directMessage.trim();
+  }
+
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const parsedJsonMessage = errorMessage.match(/"message":"([^"]+)"/);
+  if (parsedJsonMessage) {
+    return parsedJsonMessage[1].replace(/\\n/g, " ").trim();
+  }
+
+  return errorMessage.trim();
+};
+
+const createUserFacingError = (error: unknown, attemptedModels: string[]) => {
+  if (isQuotaError(error)) {
+    const retryAfterSeconds = extractRetryDelaySeconds(error);
+    const retrySuffix = retryAfterSeconds ? ` Try again in about ${retryAfterSeconds} seconds.` : "";
+    return new GeminiServiceError(
+      `Gemini API quota was exceeded for the current project.${retrySuffix} If this keeps happening, enable billing or use a key/project with higher limits.`,
+      "QUOTA_EXCEEDED",
+      retryAfterSeconds,
+    );
+  }
+
+  if (isModelUnavailableError(error)) {
+    return new GeminiServiceError(
+      `The Gemini model endpoint was unavailable for the attempted models: ${attemptedModels.join(", ")}.`,
+      "MODEL_UNAVAILABLE",
+    );
+  }
+
+  if (isAuthError(error)) {
+    const apiMessage = extractApiMessage(error);
+    return new GeminiServiceError(`Gemini access error: ${apiMessage}`, "AUTH_ERROR");
+  }
+
+  const apiMessage = extractApiMessage(error);
+  return new GeminiServiceError(`Gemini analysis failed: ${apiMessage}`, "API_ERROR");
+};
 
 const normalizeFieldConfidence = (fields: AnalysisResult["extractedFields"] = []) => {
   const numericConfidences = fields
@@ -265,112 +368,130 @@ const finalizeSummary = (
 };
 
 export const analyzeDocument = async (base64Data: string, fileName: string, mimeType: string): Promise<AnalysisResult> => {
-  const model = 'gemini-3-flash-preview';
-  
-  try {
-    const response = await ai.models.generateContent({
-      model,
-      contents: {
-        parts: [
-          { text: "Analyze this document for forgery. Perform OCR and forensic analysis. Provide the results in the specified JSON format." },
-          { inlineData: { data: base64Data, mimeType } }
-        ]
-      },
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            status: { type: Type.STRING },
-            confidenceScore: { type: Type.NUMBER },
-            summary: { type: Type.STRING },
-            extractedFields: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  label: { type: Type.STRING },
-                  value: { type: Type.STRING },
-                  confidence: { type: Type.NUMBER }
-                },
-                required: ["label", "value"]
-              }
-            },
-            suspiciousAreas: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  box_2d: { 
-                    type: Type.ARRAY, 
-                    items: { type: Type.NUMBER },
-                    minItems: 4,
-                    maxItems: 4
-                  },
-                  label: { type: Type.STRING },
-                  reason: { type: Type.STRING }
-                },
-                required: ["box_2d", "label", "reason"]
-              }
-            },
-            metadataInconsistencies: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
-            },
-            analysisSignals: {
-              type: Type.OBJECT,
-              properties: {
-                visualTampering: { type: Type.NUMBER },
-                textualConsistency: { type: Type.NUMBER },
-                metadataRisk: { type: Type.NUMBER },
-                structuralAnomalies: { type: Type.NUMBER },
-                evidenceStrength: { type: Type.NUMBER },
-                documentQuality: { type: Type.NUMBER }
-              }
-            }
-          },
-          required: ["status", "confidenceScore", "summary"]
-        }
-      }
-    });
+  let lastError: unknown;
+  const attemptedModels: string[] = [];
 
-    const data = JSON.parse(response.text || '{}') as GeminiAnalysisResponse;
-    const rawStatus = (data.status as ForgeryStatus) || ForgeryStatus.SUSPICIOUS;
-    const extractedFields = sanitizeExtractedFields(data.extractedFields || []);
-    const suspiciousAreas = sanitizeSuspiciousAreas(data.suspiciousAreas || []);
-    const metadataInconsistencies = sanitizeMetadataIssues(data.metadataInconsistencies || []);
-    const status = deriveStatus(
-      rawStatus,
-      suspiciousAreas,
-      metadataInconsistencies,
-      extractedFields,
-      data.analysisSignals,
-    );
-    const confidenceScore = deriveConfidenceScore(
-      status,
-      data.confidenceScore,
-      extractedFields,
-      suspiciousAreas,
-      metadataInconsistencies,
-      data.analysisSignals,
-    );
-    
-    return {
-      id: Math.random().toString(36).substr(2, 9),
-      fileName,
-      fileType: mimeType,
-      timestamp: new Date().toISOString(),
-      status,
-      confidenceScore,
-      summary: finalizeSummary(data.summary, status, suspiciousAreas, metadataInconsistencies, data.analysisSignals),
-      extractedFields,
-      suspiciousAreas,
-      metadataInconsistencies,
-      thumbnail: `data:${mimeType};base64,${base64Data}`
-    };
-  } catch (error) {
-    console.error("AI Analysis failed:", error);
-    throw error;
+  for (const model of GEMINI_MODEL_CANDIDATES) {
+    attemptedModels.push(model);
+
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: {
+          parts: [
+            { text: "Analyze this document for forgery. Perform OCR and forensic analysis. Provide the results in the specified JSON format." },
+            { inlineData: { data: base64Data, mimeType } }
+          ]
+        },
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              status: { type: Type.STRING },
+              confidenceScore: { type: Type.NUMBER },
+              summary: { type: Type.STRING },
+              extractedFields: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    label: { type: Type.STRING },
+                    value: { type: Type.STRING },
+                    confidence: { type: Type.NUMBER }
+                  },
+                  required: ["label", "value"]
+                }
+              },
+              suspiciousAreas: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    box_2d: {
+                      type: Type.ARRAY,
+                      items: { type: Type.NUMBER },
+                      minItems: 4,
+                      maxItems: 4
+                    },
+                    label: { type: Type.STRING },
+                    reason: { type: Type.STRING }
+                  },
+                  required: ["box_2d", "label", "reason"]
+                }
+              },
+              metadataInconsistencies: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING }
+              },
+              analysisSignals: {
+                type: Type.OBJECT,
+                properties: {
+                  visualTampering: { type: Type.NUMBER },
+                  textualConsistency: { type: Type.NUMBER },
+                  metadataRisk: { type: Type.NUMBER },
+                  structuralAnomalies: { type: Type.NUMBER },
+                  evidenceStrength: { type: Type.NUMBER },
+                  documentQuality: { type: Type.NUMBER }
+                }
+              }
+            },
+            required: ["status", "confidenceScore", "summary"]
+          }
+        }
+      });
+
+      const data = JSON.parse(response.text || '{}') as GeminiAnalysisResponse;
+      const rawStatus = (data.status as ForgeryStatus) || ForgeryStatus.SUSPICIOUS;
+      const extractedFields = sanitizeExtractedFields(data.extractedFields || []);
+      const suspiciousAreas = sanitizeSuspiciousAreas(data.suspiciousAreas || []);
+      const metadataInconsistencies = sanitizeMetadataIssues(data.metadataInconsistencies || []);
+      const status = deriveStatus(
+        rawStatus,
+        suspiciousAreas,
+        metadataInconsistencies,
+        extractedFields,
+        data.analysisSignals,
+      );
+      const confidenceScore = deriveConfidenceScore(
+        status,
+        data.confidenceScore,
+        extractedFields,
+        suspiciousAreas,
+        metadataInconsistencies,
+        data.analysisSignals,
+      );
+      
+      return {
+        id: Math.random().toString(36).substr(2, 9),
+        fileName,
+        fileType: mimeType,
+        timestamp: new Date().toISOString(),
+        status,
+        confidenceScore,
+        summary: finalizeSummary(data.summary, status, suspiciousAreas, metadataInconsistencies, data.analysisSignals),
+        extractedFields,
+        suspiciousAreas,
+        metadataInconsistencies,
+        thumbnail: `data:${mimeType};base64,${base64Data}`
+      };
+    } catch (error) {
+      lastError = error;
+
+      if (isQuotaError(error)) {
+        continue;
+      }
+
+      if (isModelUnavailableError(error)) {
+        continue;
+      }
+
+      break;
+    }
   }
+
+  const userFacingError = createUserFacingError(lastError, attemptedModels);
+  console.error("AI Analysis failed:", userFacingError, lastError);
+  throw userFacingError;
 };
