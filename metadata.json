@@ -1,0 +1,8 @@
+
+{
+  "name": "Docx Verify AI - Forgery Detection",
+  "description": "Enterprise-grade AI document forensic system for detecting forged financial documents, identity cards, and bank statements using advanced vision analysis.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
