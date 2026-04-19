@@ -15,6 +15,6 @@ View your app in AI Studio: https://ai.studio/apps/temp/1
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. Set your Gemini API key in [services/geminiConfig.ts](/c:/Users/roope/Downloads/docx-verify-ai---forgery-detection/services/geminiConfig.ts:1)
 3. Run the app:
    `npm run dev`

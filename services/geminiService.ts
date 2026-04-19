@@ -1,8 +1,9 @@
 
 import { GoogleGenAI, Type } from "@google/genai";
 import { AnalysisResult, ForgeryStatus } from "../types";
+import { GEMINI_API_KEY } from "./geminiConfig";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 const SYSTEM_INSTRUCTION = `
 You are an expert Forensic Document Examiner (FDE) specialized in detecting digital and physical document forgery. 
