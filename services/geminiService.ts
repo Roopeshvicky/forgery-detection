@@ -1,9 +1,8 @@
 
 import { GoogleGenAI, Type } from "@google/genai";
 import { AnalysisResult, ForgeryStatus } from "../types";
-import { GEMINI_API_KEY } from "./geminiConfig";
+import { getGeminiApiKey } from "./geminiConfig";
 
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 const GEMINI_MODEL_CANDIDATES = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"] as const;
 
 type AnalysisSignals = {
@@ -220,6 +219,19 @@ const createUserFacingError = (error: unknown, attemptedModels: string[]) => {
   return new GeminiServiceError(`Gemini analysis failed: ${apiMessage}`, "API_ERROR");
 };
 
+const createGeminiClient = () => {
+  const apiKey = getGeminiApiKey();
+
+  if (!apiKey) {
+    throw new GeminiServiceError(
+      "Missing Gemini API key. Add VITE_GEMINI_API_KEY in your Vercel project environment variables and redeploy.",
+      "AUTH_ERROR",
+    );
+  }
+
+  return new GoogleGenAI({ apiKey });
+};
+
 const normalizeFieldConfidence = (fields: AnalysisResult["extractedFields"] = []) => {
   const numericConfidences = fields
     .map((field) => field.confidence)
@@ -368,6 +380,7 @@ const finalizeSummary = (
 };
 
 export const analyzeDocument = async (base64Data: string, fileName: string, mimeType: string): Promise<AnalysisResult> => {
+  const ai = createGeminiClient();
   let lastError: unknown;
   const attemptedModels: string[] = [];
 
